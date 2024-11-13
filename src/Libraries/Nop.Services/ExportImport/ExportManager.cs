@@ -347,9 +347,13 @@ public partial class ExportManager : IExportManager
     protected virtual async Task<object> GetLimitedToStoresAsync(Product product)
     {
         string limitedToStores = null;
+
         foreach (var storeMapping in await _storeMappingService.GetStoreMappingsAsync(product))
         {
             var store = await _storeService.GetStoreByIdAsync(storeMapping.StoreId);
+
+            if (store == null)
+                continue;
 
             limitedToStores += _catalogSettings.ExportImportRelatedEntitiesByName ? store.Name : store.Id.ToString();
 
@@ -1503,6 +1507,15 @@ public partial class ExportManager : IExportManager
             new PropertyByName<Product, Language>("SeName", async (p, l) => await _urlRecordService.GetSeNameAsync(p, l.Id, returnDefaultValue: false), await IgnoreExportProductPropertyAsync(p => p.Seo))
         };
 
+        var productAdvancedMode = true;
+        try
+        {
+            productAdvancedMode = await _genericAttributeService.GetAttributeAsync<bool>(await _workContext.GetCurrentCustomerAsync(), "product-advanced-mode");
+        }
+        catch (ArgumentNullException)
+        {
+        }
+
         var properties = new[]
         {
             new PropertyByName<Product, Language>("ProductId", (p, l) => p.Id),
@@ -1655,23 +1668,14 @@ public partial class ExportManager : IExportManager
             new PropertyByName<Product, Language>("ProductTags", async (p, l) =>  await GetProductTagsAsync(p), await IgnoreExportProductPropertyAsync(p => p.ProductTags)),
             new PropertyByName<Product, Language>("IsLimitedToStores", (p, l) => p.LimitedToStores, await IgnoreExportLimitedToStoreAsync()),
             new PropertyByName<Product, Language>("LimitedToStores",async (p, l) =>  await GetLimitedToStoresAsync(p), await IgnoreExportLimitedToStoreAsync()),
-            new PropertyByName<Product, Language>("DisplayAttributeCombinationImagesOnly",(p, l) =>  p.DisplayAttributeCombinationImagesOnly, !_productEditorSettings.DisplayAttributeCombinationImagesOnly),
+            new PropertyByName<Product, Language>("DisplayAttributeCombinationImagesOnly",(p, l) =>  p.DisplayAttributeCombinationImagesOnly, !productAdvancedMode),
             new PropertyByName<Product, Language>("Picture1", async (p, l) => await GetPictureAsync(p, 0)),
             new PropertyByName<Product, Language>("Picture2", async (p, l) => await GetPictureAsync(p, 1)),
             new PropertyByName<Product, Language>("Picture3", async (p, l) => await GetPictureAsync(p, 2))
         };
 
         var productList = products.ToList();
-
-        var productAdvancedMode = true;
-        try
-        {
-            productAdvancedMode = await _genericAttributeService.GetAttributeAsync<bool>(await _workContext.GetCurrentCustomerAsync(), "product-advanced-mode");
-        }
-        catch (ArgumentNullException)
-        {
-        }
-
+        
         if (!_catalogSettings.ExportImportProductAttributes && !_catalogSettings.ExportImportProductSpecificationAttributes)
             return await new PropertyManager<Product, Language>(properties, _catalogSettings).ExportToXlsxAsync(productList);
 

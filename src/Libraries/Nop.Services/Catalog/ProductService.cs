@@ -17,6 +17,7 @@ using Nop.Services.Messages;
 using Nop.Services.Security;
 using Nop.Services.Shipping.Date;
 using Nop.Services.Stores;
+using Nop.Services.Vendors;
 
 namespace Nop.Services.Catalog;
 
@@ -62,6 +63,7 @@ public partial class ProductService : IProductService
     protected readonly IStaticCacheManager _staticCacheManager;
     protected readonly IStoreMappingService _storeMappingService;
     protected readonly IStoreService _storeService;
+    protected readonly IVendorService _vendorService;
     protected readonly IWorkContext _workContext;
     protected readonly LocalizationSettings _localizationSettings;
     private static readonly char[] _separator = [','];
@@ -104,6 +106,7 @@ public partial class ProductService : IProductService
         ISearchPluginManager searchPluginManager,
         IStaticCacheManager staticCacheManager,
         IStoreService storeService,
+        IVendorService vendorService,
         IStoreMappingService storeMappingService,
         IWorkContext workContext,
         LocalizationSettings localizationSettings)
@@ -143,6 +146,7 @@ public partial class ProductService : IProductService
         _staticCacheManager = staticCacheManager;
         _storeMappingService = storeMappingService;
         _storeService = storeService;
+        _vendorService = vendorService;
         _workContext = workContext;
         _localizationSettings = localizationSettings;
     }
@@ -662,7 +666,7 @@ public partial class ProductService : IProductService
             //apply ACL constraints
             query = await _aclService.ApplyAcl(query, customerRoleIds);
 
-            featuredProducts = query.ToList();
+            featuredProducts = await query.ToListAsync();
 
             return featuredProducts.Select(p => p.Id).ToList();
         });
@@ -709,7 +713,7 @@ public partial class ProductService : IProductService
             //apply ACL constraints
             query = await _aclService.ApplyAcl(query, customerRoleIds);
 
-            return query.Select(p => p.Id).ToList();
+            return await query.Select(p => p.Id).ToListAsync();
         });
 
         if (!featuredProducts.Any() && featuredProductIds.Any())
@@ -786,7 +790,7 @@ public partial class ProductService : IProductService
             .PrepareKeyForDefaultCache(NopCatalogDefaults.CategoryProductsNumberCacheKey, customerRoleIds, storeId, categoryIds);
 
         //only distinct products
-        return await _staticCacheManager.GetAsync(cacheKey, () => query.Select(p => p.Id).Count());
+        return await _staticCacheManager.GetAsync(cacheKey, () => query.Select(p => p.Id).CountAsync());
     }
 
     /// <summary>
@@ -1391,32 +1395,6 @@ public partial class ProductService : IProductService
     }
 
     /// <summary>
-    /// Update HasTierPrices property (used for performance optimization)
-    /// </summary>
-    /// <param name="product">Product</param>
-    /// <returns>A task that represents the asynchronous operation</returns>
-    public virtual async Task UpdateHasTierPricesPropertyAsync(Product product)
-    {
-        ArgumentNullException.ThrowIfNull(product);
-
-        product.HasTierPrices = (await GetTierPricesByProductAsync(product.Id)).Any();
-        await UpdateProductAsync(product);
-    }
-
-    /// <summary>
-    /// Update HasDiscountsApplied property (used for performance optimization)
-    /// </summary>
-    /// <param name="product">Product</param>
-    /// <returns>A task that represents the asynchronous operation</returns>
-    public virtual async Task UpdateHasDiscountsAppliedAsync(Product product)
-    {
-        ArgumentNullException.ThrowIfNull(product);
-
-        product.HasDiscountsApplied = _discountProductMappingRepository.Table.Any(dpm => dpm.EntityId == product.Id);
-        await UpdateProductAsync(product);
-    }
-
-    /// <summary>
     /// Gets number of products by vendor identifier
     /// </summary>
     /// <param name="vendorId">Vendor identifier</param>
@@ -1848,6 +1826,12 @@ public partial class ProductService : IProductService
                 //do not inject IWorkflowMessageService via constructor because it'll cause circular references
                 var workflowMessageService = EngineContext.Current.Resolve<IWorkflowMessageService>();
                 await workflowMessageService.SendQuantityBelowStoreOwnerNotificationAsync(product, _localizationSettings.DefaultAdminLanguageId);
+
+                if (product.VendorId != 0)
+                {
+                    var vendor = await _vendorService.GetVendorByIdAsync(product.VendorId);
+                    await workflowMessageService.SendQuantityBelowVendorNotificationAsync(product, vendor, _localizationSettings.DefaultAdminLanguageId);
+                }
             }
         }
 
@@ -1877,6 +1861,12 @@ public partial class ProductService : IProductService
                     //do not inject IWorkflowMessageService via constructor because it'll cause circular references
                     var workflowMessageService = EngineContext.Current.Resolve<IWorkflowMessageService>();
                     await workflowMessageService.SendQuantityBelowStoreOwnerNotificationAsync(combination, _localizationSettings.DefaultAdminLanguageId);
+
+                    if (product.VendorId != 0)
+                    {
+                        var vendor = await _vendorService.GetVendorByIdAsync(product.VendorId);
+                        await workflowMessageService.SendQuantityBelowVendorNotificationAsync(combination, vendor, _localizationSettings.DefaultAdminLanguageId);
+                    }
                 }
             }
         }
@@ -2162,10 +2152,6 @@ public partial class ProductService : IProductService
         ArgumentNullException.ThrowIfNull(product);
         ArgumentNullException.ThrowIfNull(customer);
 
-        //we use this property ("HasTierPrices") for performance optimization to avoid unnecessary database calls
-        if (!product.HasTierPrices)
-            return null;
-
         //get actual tier prices
         return (await GetTierPricesByProductAsync(product.Id))
             .OrderBy(price => price.Quantity)
@@ -2183,11 +2169,9 @@ public partial class ProductService : IProductService
     /// <returns>A task that represents the asynchronous operation</returns>
     public virtual async Task<IList<TierPrice>> GetTierPricesByProductAsync(int productId)
     {
-        var query = _tierPriceRepository.Table.Where(tp => tp.ProductId == productId);
-
         return await _staticCacheManager.GetAsync(
             _staticCacheManager.PrepareKeyForDefaultCache(NopCatalogDefaults.TierPricesByProductCacheKey, productId),
-            async () => await query.ToListAsync());
+            async () => await _tierPriceRepository.Table.Where(tp => tp.ProductId == productId).ToListAsync());
     }
 
     /// <summary>
@@ -2248,11 +2232,6 @@ public partial class ProductService : IProductService
     {
         ArgumentNullException.ThrowIfNull(product);
         ArgumentNullException.ThrowIfNull(customer);
-
-
-        //we use this property ("HasTierPrices") for performance optimization to avoid unnecessary database calls
-        if (!product.HasTierPrices)
-            return null;
 
         //get the most suitable tier price based on the passed quantity
         return (await GetTierPricesAsync(product, customer, store))?.LastOrDefault(price => quantity >= price.Quantity);
@@ -2356,7 +2335,7 @@ public partial class ProductService : IProductService
     public virtual async Task<IPagedList<Product>> GetProductsWithAppliedDiscountAsync(int? discountId = null,
         bool showHidden = false, int pageIndex = 0, int pageSize = int.MaxValue)
     {
-        var products = _productRepository.Table.Where(product => product.HasDiscountsApplied);
+        var products = _productRepository.Table;
 
         if (discountId.HasValue)
             products = from product in products
@@ -2582,8 +2561,8 @@ public partial class ProductService : IProductService
         ArgumentNullException.ThrowIfNull(productReview);
 
         var customer = await _workContext.GetCurrentCustomerAsync();
-        var prh = _productReviewHelpfulnessRepository.Table
-            .SingleOrDefault(h => h.ProductReviewId == productReview.Id && h.CustomerId == customer.Id);
+        var prh = await _productReviewHelpfulnessRepository.Table
+            .SingleOrDefaultAsync(h => h.ProductReviewId == productReview.Id && h.CustomerId == customer.Id);
 
         if (prh is null)
         {
@@ -2795,9 +2774,6 @@ public partial class ProductService : IProductService
         await foreach (var pdcm in mappingsWithProducts.ToAsyncEnumerable())
         {
             mappingsToDelete.Add(pdcm.dcm);
-
-            //update "HasDiscountsApplied" property
-            await UpdateHasDiscountsAppliedAsync(pdcm.product);
         }
         await _discountProductMappingRepository.DeleteAsync(mappingsToDelete);
     }

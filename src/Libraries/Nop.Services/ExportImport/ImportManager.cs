@@ -13,7 +13,6 @@ using Nop.Core.Domain.Orders;
 using Nop.Core.Domain.Payments;
 using Nop.Core.Domain.Security;
 using Nop.Core.Domain.Shipping;
-using Nop.Core.Domain.Stores;
 using Nop.Core.Domain.Tax;
 using Nop.Core.Domain.Vendors;
 using Nop.Core.Http;
@@ -1740,7 +1739,6 @@ public partial class ImportManager : IImportManager
         }
 
         var iRow = 2;
-        var rolesToSave = new List<int>();
         var allRoles = await _customerService.GetAllCustomerRolesAsync();
         var countries = await _countryService.GetAllCountriesAsync();
         var states = await _stateProvinceService.GetStateProvincesAsync();
@@ -1773,6 +1771,8 @@ public partial class ImportManager : IImportManager
                     CustomerGuid = Guid.Empty.Equals(customerGuid) ? Guid.NewGuid() : customerGuid,
                     CreatedOnUtc = DateTime.UtcNow
                 };
+
+            var rolesToSave = new List<int>();
 
             foreach (var property in manager.GetDefaultProperties)
             {
@@ -2000,13 +2000,17 @@ public partial class ImportManager : IImportManager
         var allProductsCategoryIds = await _categoryService.GetProductCategoryIdsAsync(allProductsBySku.Select(p => p.Id).ToArray());
 
         //performance optimization, load all categories in one SQL request
-        Dictionary<CategoryKey, Category> allCategories;
+        Dictionary<CategoryKey, Category> allCategories = new();
         try
         {
             var allCategoryList = await _categoryService.GetAllCategoriesAsync(showHidden: true);
 
             allCategories = await allCategoryList
-                .ToDictionaryAwaitAsync(async c => await CategoryKey.CreateCategoryKeyAsync(c, _categoryService, allCategoryList, _storeMappingService), c => new ValueTask<Category>(c));
+                .WhereAwait(async c => await _categoryService.CanVendorAddProductsAsync(c, allCategoryList))
+                .ToDictionaryAwaitAsync(async c => {
+                    var keyName = await _categoryService.GetFormattedBreadCrumbAsync(c, allCategoryList);
+                    return new CategoryKey(keyName, c, c.LimitedToStores ? (await _storeMappingService.GetStoresIdsWithAccessAsync(c)).ToList() : new List<int>());
+                });
         }
         catch (ArgumentException)
         {
@@ -2445,7 +2449,7 @@ public partial class ImportManager : IImportManager
                     : new List<int>();
 
                 var importedCategories = await categoryList.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(categoryName => new CategoryKey(categoryName, storesIds))
+                    .Select(categoryName => new CategoryKey(categoryName, storesIds: storesIds))
                     .SelectAwait(async categoryKey =>
                     {
                         var rez = (allCategories.TryGetValue(categoryKey, out var value) ? value.Id : allCategories.Values.FirstOrDefault(c => c.Name == categoryKey.Key)?.Id) ??
@@ -2578,10 +2582,6 @@ public partial class ImportManager : IImportManager
             });
 
             lastLoadedProduct = product;
-
-            //update "HasTierPrices" and "HasDiscountsApplied" properties
-            //_productService.UpdateHasTierPricesProperty(product);
-            //_productService.UpdateHasDiscountsApplied(product);
         }
 
         if (_mediaSettings.ImportProductImagesUsingHash && await _pictureService.IsStoreInDbAsync())
@@ -3012,9 +3012,8 @@ public partial class ImportManager : IImportManager
     public virtual async Task ImportOrdersFromXlsxAsync(Stream stream)
     {
         using var workbook = new XLWorkbook(stream);
-        var downloadedFiles = new List<string>();
 
-        (var metadata, var worksheet) = await PrepareImportOrderDataAsync(workbook);
+        var (metadata, worksheet) = await PrepareImportOrderDataAsync(workbook);
 
         //performance optimization, load all orders by guid in one SQL request
         var allOrdersByGuids = await _orderService.GetOrdersByGuidsAsync(metadata.AllOrderGuids.ToArray());
@@ -3035,10 +3034,9 @@ public partial class ImportManager : IImportManager
                 metadata.OrderItemManager.ReadDefaultFromXlsx(worksheet, iRow, 2);
 
                 //skip caption row
-                if (!metadata.OrderItemManager.IsCaption)
-                {
+                if (!metadata.OrderItemManager.IsCaption) 
                     await ImportOrderItemAsync(metadata.OrderItemManager, lastLoadedOrder);
-                }
+
                 continue;
             }
 
@@ -3066,12 +3064,14 @@ public partial class ImportManager : IImportManager
 
             var customer = allCustomersByGuids.FirstOrDefault(p => p.CustomerGuid.ToString() == metadata.Manager.GetDefaultProperty("CustomerGuid").StringValue);
 
+            var billingStateProvinceAbbreviation = string.Empty;
+            var shippingStateProvinceAbbreviation = string.Empty;
+
             foreach (var property in metadata.Manager.GetDefaultProperties)
-            {
                 switch (property.PropertyName)
                 {
                     case "StoreId":
-                        if (await _storeService.GetStoreByIdAsync(property.IntValue) is Store orderStore)
+                        if (await _storeService.GetStoreByIdAsync(property.IntValue) is { })
                             order.StoreId = property.IntValue;
                         else
                             order.StoreId = (await _storeContext.GetCurrentStoreAsync())?.Id ?? 0;
@@ -3191,14 +3191,14 @@ public partial class ImportManager : IImportManager
                         orderBillingAddress.County = property.StringValue;
                         break;
                     case "BillingStateProvinceAbbreviation":
-                        if (await _stateProvinceService.GetStateProvinceByAbbreviationAsync(property.StringValue) is StateProvince billingState)
-                            orderBillingAddress.StateProvinceId = billingState.Id;
+                        billingStateProvinceAbbreviation = property.StringValue;
+                        
                         break;
                     case "BillingZipPostalCode":
                         orderBillingAddress.ZipPostalCode = property.StringValue;
                         break;
                     case "BillingCountryCode":
-                        if (await _countryService.GetCountryByTwoLetterIsoCodeAsync(property.StringValue) is Country billingCountry)
+                        if (await _countryService.GetCountryByTwoLetterIsoCodeAsync(property.StringValue) is { } billingCountry)
                             orderBillingAddress.CountryId = billingCountry.Id;
                         break;
                     case "ShippingFirstName":
@@ -3232,18 +3232,22 @@ public partial class ImportManager : IImportManager
                         orderAddress.County = property.StringValue;
                         break;
                     case "ShippingStateProvinceAbbreviation":
-                        if (await _stateProvinceService.GetStateProvinceByAbbreviationAsync(property.StringValue) is StateProvince shippingState)
-                            orderAddress.StateProvinceId = shippingState.Id;
+                        shippingStateProvinceAbbreviation = property.StringValue;
                         break;
                     case "ShippingZipPostalCode":
                         orderAddress.ZipPostalCode = property.StringValue;
                         break;
                     case "ShippingCountryCode":
-                        if (await _countryService.GetCountryByTwoLetterIsoCodeAsync(property.StringValue) is Country shippingCountry)
+                        if (await _countryService.GetCountryByTwoLetterIsoCodeAsync(property.StringValue) is { } shippingCountry)
                             orderAddress.CountryId = shippingCountry.Id;
                         break;
                 }
-            }
+
+            if (await _stateProvinceService.GetStateProvinceByAbbreviationAsync(billingStateProvinceAbbreviation, orderBillingAddress.CountryId) is { } billingState)
+                orderBillingAddress.StateProvinceId = billingState.Id;
+
+            if (await _stateProvinceService.GetStateProvinceByAbbreviationAsync(shippingStateProvinceAbbreviation, orderAddress.CountryId) is { } shippingState)
+                orderAddress.StateProvinceId = shippingState.Id;
 
             //check order address field values from excel
             if (string.IsNullOrWhiteSpace(orderAddress.FirstName) && string.IsNullOrWhiteSpace(orderAddress.LastName) && string.IsNullOrWhiteSpace(orderAddress.Email))
@@ -3340,26 +3344,18 @@ public partial class ImportManager : IImportManager
         public bool IsNew { get; set; }
     }
 
-    public partial class CategoryKey
+    protected partial class CategoryKey
     {
-        /// <returns>A task that represents the asynchronous operation</returns>
-        public static async Task<CategoryKey> CreateCategoryKeyAsync(Category category, ICategoryService categoryService, IList<Category> allCategories, IStoreMappingService storeMappingService)
-        {
-            return new CategoryKey(await categoryService.GetFormattedBreadCrumbAsync(category, allCategories), category.LimitedToStores ? (await storeMappingService.GetStoresIdsWithAccessAsync(category)).ToList() : new List<int>())
-            {
-                Category = category
-            };
-        }
-
-        public CategoryKey(string key, List<int> storesIds = null)
+        public CategoryKey(string key, Category category = null, List<int> storesIds = null)
         {
             Key = key.Trim();
             StoresIds = storesIds ?? new List<int>();
+            Category = category;
         }
 
         public List<int> StoresIds { get; }
 
-        public Category Category { get; protected set; }
+        public Category Category { get; }
 
         public string Key { get; }
 
